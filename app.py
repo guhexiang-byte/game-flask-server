@@ -1,98 +1,106 @@
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-import sqlite3
-import os
+from flask import Flask, render_template
+from flask_socketio import SocketIO, emit, join_room, leave_room
+from collections import deque
 import time
 
 app = Flask(__name__)
-CORS(app)
-app.config['JSON_AS_ASCII'] = False
-DB_FILE = "forum_data.db"
-MAX_MESSAGE_COUNT = 80
+app.config['SECRET_KEY'] = 'wechat-lite-secret'
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
-# 初始化数据库表
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute('''
-    CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        room TEXT,
-        create_time REAL,
-        content TEXT
-    )
-    ''')
-    conn.commit()
-    conn.close()
-
-# 数据库工具函数
-def db_query(sql, args=()):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(sql, args)
-    res = cur.fetchall()
-    conn.close()
-    return res
-
-def db_execute(sql, args=()):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(sql, args)
-    conn.commit()
-    conn.close()
-
-init_db()
+# 在线用户 {sid: {'nickname': str, 'room': str}}
+users = {}
+# 消息历史 {room: deque([{'nickname': str, 'msg': str, 'time': str}, ...])}
+message_history = {}
+MAX_HISTORY = 100
 
 @app.route('/')
 def index():
-    return """
-===持久化论坛接口===
-GET  /api/forum?room=房间名 → 获取留言列表
-POST /api/forum?room=房间名 → 发布留言
-DELETE /api/forum?room=房间名 → 清空房间全部留言
-DELETE /api/forum?room=房间名&index=数字 → 删除指定单条
-"""
+    return render_template('index.html')
 
-@app.route('/api/forum', methods=["GET", "POST", "DELETE"])
-def forum():
-    try:
-        room_id = request.args.get("room", "default").strip()
+@socketio.on('join')
+def handle_join(data):
+    nickname = data.get('nickname', '匿名用户').strip()[:20]
+    room = data.get('room', '大厅').strip()[:20]
+    if not nickname:
+        nickname = '匿名用户'
+    users[request.sid] = {'nickname': nickname, 'room': room}
+    join_room(room)
+    
+    # 初始化房间历史
+    if room not in message_history:
+        message_history[room] = deque(maxlen=MAX_HISTORY)
+    
+    # 发送历史消息给新用户
+    history = list(message_history[room])
+    emit('history', {'messages': history})
+    
+    # 广播用户加入
+    now = time.strftime('%H:%M')
+    emit('system', {'msg': f'{nickname} 加入了 {room}', 'time': now}, room=room)
+    
+    # 更新在线列表
+    update_user_list(room)
 
-        if request.method == "POST":
-            json_data = request.get_json()
-            now = time.time()
-            db_execute(
-                "INSERT INTO messages(room, create_time, content) VALUES (?,?,?)",
-                (room_id, now, str(json_data))
-            )
-            # 超出上限，删除最早消息
-            all_msg = db_query("SELECT id FROM messages WHERE room=? ORDER BY create_time ASC", (room_id,))
-            if len(all_msg) > MAX_MESSAGE_COUNT:
-                remove_count = len(all_msg) - MAX_MESSAGE_COUNT
-                for i in range(remove_count):
-                    mid = all_msg[i][0]
-                    db_execute("DELETE FROM messages WHERE id=?", (mid,))
+@socketio.on('send_message')
+def handle_message(data):
+    if request.sid not in users:
+        return
+    user = users[request.sid]
+    msg = str(data.get('msg', '')).strip()[:500]
+    if not msg:
+        return
+    now = time.strftime('%H:%M')
+    message_data = {'nickname': user['nickname'], 'msg': msg, 'time': now}
+    
+    # 存历史
+    if user['room'] not in message_history:
+        message_history[user['room']] = deque(maxlen=MAX_HISTORY)
+    message_history[user['room']].append(message_data)
+    
+    # 广播给房间所有人
+    emit('new_message', message_data, room=user['room'])
 
-        elif request.method == "DELETE":
-            index_text = request.args.get("index")
-            if index_text is None:
-                db_execute("DELETE FROM messages WHERE room=?", (room_id,))
-            else:
-                idx = int(index_text)
-                data = db_query("SELECT id FROM messages WHERE room=? ORDER BY create_time ASC", (room_id,))
-                if 0 <= idx < len(data):
-                    mid = data[idx][0]
-                    db_execute("DELETE FROM messages WHERE id=?", (mid,))
+@socketio.on('switch_room')
+def handle_switch_room(data):
+    if request.sid not in users:
+        return
+    user = users[request.sid]
+    old_room = user['room']
+    new_room = str(data.get('room', '大厅')).strip()[:20]
+    if not new_room or new_room == old_room:
+        return
+    
+    leave_room(old_room)
+    now = time.strftime('%H:%M')
+    emit('system', {'msg': f'{user["nickname"]} 离开了', 'time': now}, room=old_room)
+    update_user_list(old_room)
+    
+    user['room'] = new_room
+    join_room(new_room)
+    
+    if new_room not in message_history:
+        message_history[new_room] = deque(maxlen=MAX_HISTORY)
+    
+    history = list(message_history[new_room])
+    emit('history', {'messages': history})
+    emit('system', {'msg': f'{user["nickname"]} 加入了 {new_room}', 'time': now}, room=new_room)
+    update_user_list(new_room)
 
-        # 查询当前房间所有消息
-        rows = db_query("SELECT create_time, content FROM messages WHERE room=? ORDER BY create_time ASC", (room_id,))
-        output = []
-        for t, c in rows:
-            output.append({"time": t, "content": eval(c)})
-        return jsonify(output)
+@socketio.on('disconnect')
+def handle_disconnect():
+    if request.sid not in users:
+        return
+    user = users[request.sid]
+    room = user['room']
+    now = time.strftime('%H:%M')
+    emit('system', {'msg': f'{user["nickname"]} 离开了', 'time': now}, room=room)
+    del users[request.sid]
+    update_user_list(room)
 
-    except Exception as e:
-        return jsonify({"code": -1, "msg": "请求异常"}), 400
+def update_user_list(room):
+    online_users = [u['nickname'] for u in users.values() if u['room'] == room]
+    emit('user_list', {'users': online_users, 'count': len(online_users)}, room=room)
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False, threaded=True)
+    port = int(__import__('os').environ.get('PORT', 5000))
+    socketio.run(app, host='0.0.0.0', port=port)
